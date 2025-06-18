@@ -1,9 +1,3 @@
 package models
 
-
-type User struct {
-
-
-
-}
-
+type User struct {}

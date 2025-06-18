@@ -1,7 +1,3 @@
 package models
 
-
-type Transcation struct {
-
-
-}
+type Transaction struct{}
