@@ -1,6 +1,3 @@
 package models
 
-type Merch struct {
-
-
-}
+type Merch struct {}
