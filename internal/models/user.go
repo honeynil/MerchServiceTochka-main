@@ -17,6 +17,9 @@ func (u *User) Validate() error {
 	if u.Username == "" {
 		return fmt.Errorf("username is required")
 	}
+	if len(u.Username) > 50 {
+		return fmt.Errorf("username too long")
+	}
 	if u.PasswordHash == "" {
 		return fmt.Errorf("password_hash is required")
 	}
