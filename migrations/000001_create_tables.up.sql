@@ -16,7 +16,7 @@ CREATE TABLE transactions (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     related_id INTEGER NOT NULL,
-    amount INTEGER NOT NULL CHECK (amount > 0),
+    amount INTEGER NOT NULL,
     type TEXT NOT NULL CHECK (type IN ('purchase', 'transfer')),
     status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
