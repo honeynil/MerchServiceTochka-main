@@ -60,6 +60,12 @@ func (r *PostgresTransactionRepository) Create(ctx context.Context, tx *models.T
 		return 0, err
 	}
 
+	if tx.Amount <= 0 {
+		err = fmt.Errorf("amount must be positive")
+		slog.Error("amount must be positive", "method", "Create", "amount", tx.Amount, "error", err)
+		return 0, err
+	}
+
 	span.SetAttributes(
 		attribute.Int("user_id", int(tx.UserID)),
 		attribute.Int("related_id", int(tx.RelatedID)),
@@ -73,29 +79,30 @@ func (r *PostgresTransactionRepository) Create(ctx context.Context, tx *models.T
 		slog.Error("failed to begin transaction", "method", "Create", "error", err)
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			if rbErr := dbTx.Rollback(); rbErr != nil {
-				err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
-				slog.Error("rollback failed", "method", "Create", "error", rbErr)
-			}
-		} else {
-			if commitErr := dbTx.Commit(); commitErr != nil {
-				err = fmt.Errorf("failed to commit transaction: %w", commitErr)
-				slog.Error("failed to commit transaction", "method", "Create", "error", commitErr)
-			}
-		}
-	}()
 
 	query := `INSERT INTO transactions (user_id, related_id, amount, type, status) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`
-	err = dbTx.QueryRowContext(ctx, query, tx.UserID, tx.RelatedID, tx.Amount, tx.Type, tx.Status).Scan(&tx.ID, &tx.CreatedAt)
+	var txID int32
+	var createdAt time.Time
+	err = dbTx.QueryRowContext(ctx, query, tx.UserID, tx.RelatedID, tx.Amount, tx.Type, tx.Status).Scan(&txID, &createdAt)
 	if err != nil {
-		slog.Error("failed to create transaction", "method", "Create", "user_id", tx.UserID, "related_id", tx.RelatedID, "type", tx.Type, "status", tx.Status, "error", err)
+		if rbErr := dbTx.Rollback(); rbErr != nil {
+			err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
+			slog.Error("rollback failed", "method", "Create", "error", rbErr)
+		} else {
+			slog.Error("failed to create transaction", "method", "Create", "user_id", tx.UserID, "related_id", tx.RelatedID, "type", tx.Type, "status", tx.Status, "error", err)
+		}
 		return 0, fmt.Errorf("failed to create transaction: %w", err)
 	}
 
+	if err = dbTx.Commit(); err != nil {
+		slog.Error("failed to commit transaction", "method", "Create", "error", err)
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	tx.ID = txID
+	tx.CreatedAt = createdAt
 	slog.Info("transaction created", "method", "Create", "id", tx.ID, "user_id", tx.UserID, "related_id", tx.RelatedID, "type", tx.Type, "status", tx.Status)
-	return tx.ID, nil
+	return txID, nil
 }
 
 func (r *PostgresTransactionRepository) GetByID(ctx context.Context, id int32) (*models.Transaction, error) {

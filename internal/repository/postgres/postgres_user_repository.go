@@ -28,7 +28,7 @@ func NewPostgresUserRepository(db *sql.DB) *PostgresUserRepository {
 func (r *PostgresUserRepository) Create(ctx context.Context, user *models.User) error {
 	var err error
 	tracer := otel.Tracer("user-repository")
-	ctx, span := tracer.Start(ctx, "Create")
+	ctx, span := tracer.Start(ctx, "CreateUser")
 	defer span.End()
 
 	start := time.Now()
@@ -39,8 +39,8 @@ func (r *PostgresUserRepository) Create(ctx context.Context, user *models.User) 
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		}
-		observability.RepositoryCalls.WithLabelValues("Create", status).Inc()
-		observability.RepositoryDuration.WithLabelValues("Create").Observe(time.Since(start).Seconds())
+		observability.RepositoryCalls.WithLabelValues("CreateUser", status).Inc()
+		observability.RepositoryDuration.WithLabelValues("CreateUser").Observe(time.Since(start).Seconds())
 	}()
 
 	if user == nil {
@@ -49,52 +49,57 @@ func (r *PostgresUserRepository) Create(ctx context.Context, user *models.User) 
 		return err
 	}
 
-	span.SetAttributes(attribute.String("username", user.Username))
-
 	if err = user.Validate(); err != nil {
 		slog.Error("failed to create user", "method", "Create", "error", err)
-		return fmt.Errorf("invalid user: %w", err)
+		return err
 	}
-	const defaultBalance = 1000
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	span.SetAttributes(
+		attribute.String("username", user.Username),
+		attribute.Int("balance", int(user.Balance)),
+	)
+
+	dbTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		slog.Error("failed to begin transaction", "method", "Create", "error", err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
-				slog.Error("rollback failed", "method", "Create", "error", rbErr)
-			}
-		} else {
-			if commitErr := tx.Commit(); commitErr != nil {
-				err = fmt.Errorf("failed to commit transaction: %w", commitErr)
-				slog.Error("failed to commit transaction", "method", "Create", "error", commitErr)
-			}
-		}
-	}()
 
-	query := `INSERT INTO users (username, password_hash, balance) VALUES ($1, $2, $3) RETURNING id, created_at`
-	err = tx.QueryRowContext(ctx, query, user.Username, user.PasswordHash, defaultBalance).Scan(&user.ID, &user.CreatedAt)
+	query := `INSERT INTO users (username, password_hash, balance) VALUES ($1, $2, $3) RETURNING id`
+	var userID int32
+	err = dbTx.QueryRowContext(ctx, query, user.Username, user.PasswordHash, user.Balance).Scan(&userID)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			slog.Error("username already exists", "method", "Create", "username", user.Username, "error", err)
-			return pkgerrors.ErrUserAlreadyExists
+		if rbErr := dbTx.Rollback(); rbErr != nil {
+			err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
+			slog.Error("rollback failed", "method", "Create", "error", rbErr)
+		} else {
+			slog.Error("failed to create user", "method", "Create", "username", user.Username, "error", err)
 		}
-		slog.Error("failed to create user", "method", "Create", "username", user.Username, "error", err)
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			err = pkgerrors.ErrUserAlreadyExists
+			slog.Error("username already exists", "method", "Create", "username", user.Username, "error", err)
+		}
 		return fmt.Errorf("failed to create user: %w", err)
 	}
 
+	if err = dbTx.Commit(); err != nil {
+		slog.Error("failed to commit transaction", "method", "Create", "error", err)
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	user.ID = userID
 	slog.Info("user created", "method", "Create", "username", user.Username, "id", user.ID)
 	return nil
 }
 
-func (r *PostgresUserRepository) ChangeBalance(ctx context.Context, userID, amount int32) (newBalance int32, err error) {
+func (r *PostgresUserRepository) ChangeBalance(ctx context.Context, userID, amount int32) (int32, error) {
+	var err error
 	tracer := otel.Tracer("user-repository")
 	ctx, span := tracer.Start(ctx, "ChangeBalance")
-	span.SetAttributes(attribute.Int("user_id", int(userID)), attribute.Int("amount", int(amount)))
+	span.SetAttributes(
+		attribute.Int("user_id", int(userID)),
+		attribute.Int("amount", int(amount)),
+	)
 	defer span.End()
 
 	start := time.Now()
@@ -109,37 +114,37 @@ func (r *PostgresUserRepository) ChangeBalance(ctx context.Context, userID, amou
 		observability.RepositoryDuration.WithLabelValues("ChangeBalance").Observe(time.Since(start).Seconds())
 	}()
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	dbTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		slog.Error("failed to begin transaction", "method", "ChangeBalance", "user_id", userID, "error", err)
+		slog.Error("failed to begin transaction", "method", "ChangeBalance", "error", err)
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
-				slog.Error("rollback failed", "method", "ChangeBalance", "error", rbErr)
-			}
-		} else {
-			if commitErr := tx.Commit(); commitErr != nil {
-				err = fmt.Errorf("failed to commit transaction: %w", commitErr)
-				slog.Error("failed to commit transaction", "method", "ChangeBalance", "error", commitErr)
-			}
-		}
-	}()
 
-	query := `UPDATE users SET balance = balance + $1 WHERE id = $2 AND (balance + $1) >= 0 RETURNING balance`
-	err = tx.QueryRowContext(ctx, query, amount, userID).Scan(&newBalance)
-	if stderrors.Is(err, sql.ErrNoRows) {
-		slog.Error("user not found or insufficient funds", "method", "ChangeBalance", "user_id", userID, "amount", amount, "error", err)
-		if amount < 0 {
-			return 0, pkgerrors.ErrInsufficientFunds
-		}
-		return 0, pkgerrors.ErrUserNotFound
-	}
+	query := `
+		UPDATE users
+		SET balance = balance + $1
+		WHERE id = $2 AND (balance + $1) >= 0
+		RETURNING balance
+	`
+	var newBalance int32
+	err = dbTx.QueryRowContext(ctx, query, amount, userID).Scan(&newBalance)
 	if err != nil {
-		slog.Error("failed to update balance", "method", "ChangeBalance", "user_id", userID, "error", err)
+		if rbErr := dbTx.Rollback(); rbErr != nil {
+			err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
+			slog.Error("rollback failed", "method", "ChangeBalance", "error", rbErr)
+		} else {
+			slog.Error("failed to update balance", "method", "ChangeBalance", "user_id", userID, "error", err)
+		}
+		if err == sql.ErrNoRows {
+			err = pkgerrors.ErrUserNotFoundOrInsufficientFunds
+			slog.Error("user not found or insufficient funds", "method", "ChangeBalance", "user_id", userID, "amount", amount, "error", err)
+		}
 		return 0, fmt.Errorf("failed to update balance: %w", err)
+	}
+
+	if err = dbTx.Commit(); err != nil {
+		slog.Error("failed to commit transaction", "method", "ChangeBalance", "error", err)
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	slog.Info("balance updated", "method", "ChangeBalance", "user_id", userID, "amount", amount, "new_balance", newBalance)
