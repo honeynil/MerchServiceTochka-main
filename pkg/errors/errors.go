@@ -1,0 +1,16 @@
+package errors
+
+import "errors"
+
+var (
+	ErrUserNotFound             = errors.New("user not found")
+	ErrUserAlreadyExists        = errors.New("user already exists")
+	ErrInsufficientFunds        = errors.New("insufficient funds")
+	ErrNilUser                  = errors.New("user is nil")
+	ErrMerchNotFound            = errors.New("merch not found")
+	ErrNilMerch                 = errors.New("merch is nil")
+	ErrNilTransaction           = errors.New("transaction is nil")
+	ErrInvalidTransactionType   = errors.New("invalid transaction type")
+	ErrInvalidTransactionStatus = errors.New("invalid transaction status")
+	ErrTransactionNotFound      = errors.New("transaction not found")
+)
