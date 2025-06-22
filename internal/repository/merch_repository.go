@@ -7,6 +7,6 @@ import (
 )
 
 type MerchRepository interface {
-	GetByID(ctx context.Context, id int64) (*models.Merch, error)
-	GetPrice(ctx context.Context, id int64) (int64, error)
+	GetByID(ctx context.Context, id int32) (*models.Merch, error)
+	GetPrice(ctx context.Context, id int32) (int32, error)
 }
