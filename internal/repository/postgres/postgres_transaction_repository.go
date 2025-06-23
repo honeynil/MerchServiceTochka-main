@@ -181,3 +181,50 @@ func (r *PostgresTransactionRepository) GetBalance(ctx context.Context, userID i
 	slog.Info("balance retrieved", "method", "GetBalance", "user_id", userID, "balance", balance)
 	return balance, nil
 }
+func (r *PostgresTransactionRepository) GetTransactionHistory(ctx context.Context, userID int32) ([]models.Transaction, error) {
+	var err error
+	tracer := otel.Tracer("transaction-repository")
+	ctx, span := tracer.Start(ctx, "GetTransactionHistory")
+	span.SetAttributes(attribute.Int("user_id", int(userID)))
+	defer span.End()
+
+	start := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		observability.RepositoryCalls.WithLabelValues("GetTransactionHistory", status).Inc()
+		observability.RepositoryDuration.WithLabelValues("GetTransactionHistory").Observe(time.Since(start).Seconds())
+	}()
+
+	query := `SELECT id, user_id, related_id, amount, type, status, created_at 
+              FROM transactions 
+              WHERE user_id = $1 OR related_id = $1 
+              ORDER BY created_at DESC`
+	rows, err := r.db.QueryContext(ctx, query, userID)
+	if err != nil {
+		slog.Error("failed to get transaction history", "user_id", userID, "error", err)
+		return nil, fmt.Errorf("failed to get transaction history: %w", err)
+	}
+	defer rows.Close()
+
+	var transactions []models.Transaction
+	for rows.Next() {
+		var tx models.Transaction
+		if err := rows.Scan(&tx.ID, &tx.UserID, &tx.RelatedID, &tx.Amount, &tx.Type, &tx.Status, &tx.CreatedAt); err != nil {
+			slog.Error("failed to scan transaction", "user_id", userID, "error", err)
+			return nil, fmt.Errorf("failed to scan transaction: %w", err)
+		}
+		transactions = append(transactions, tx)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("rows error", "user_id", userID, "error", err)
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	slog.Info("transaction history retrieved", "user_id", userID, "count", len(transactions))
+	return transactions, nil
+}
