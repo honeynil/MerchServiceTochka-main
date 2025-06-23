@@ -19,4 +19,6 @@ var (
 	ErrUserNotFoundOrInsufficientFunds = errors.New("user not found or insufficient funds")
 	ErrInvalidCredentials              = fmt.Errorf("invalid credentials")
 	ErrUsernameExists                  = fmt.Errorf("username already exists")
+	ErrInternal                        = fmt.Errorf("error to create user")
+	ErrInvalidInput                    = fmt.Errorf("ErrInvalidInput")
 )

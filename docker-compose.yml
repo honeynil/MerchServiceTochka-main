@@ -1,16 +1,35 @@
 version: '3.8'
+
 services:
   merch-service:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
     depends_on:
-      - postgres
-      - redis
-      - kafka
-      - migrator
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
     env_file:
       - .env
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"] # Предполагается, что есть эндпоинт /health
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merch-network
 
   postgres:
     image: postgres:15
@@ -22,11 +41,25 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merch-network
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - merch-network
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -37,8 +70,21 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MESSAGE_MAX_BYTES: 10485760 # 10MB
+      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - merch-network
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -47,6 +93,15 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SESSION_TIMEOUT_MS: 60000 # Увеличенный таймаут
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 100 # Больше подключений
+    healthcheck:
+      test: ["CMD", "zookeeper-shell", "localhost:2181", "ls", "/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merch-network
 
   migrator:
     image: migrate/migrate:v4.18.1
@@ -57,7 +112,69 @@ services:
       - "-database=postgres://postgres:postgres@postgres:5432/merch?sslmode=disable"
       - "up"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - merch-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    ports:
+      - "16686:16686" # Веб-интерфейс
+      - "4318:4318"  # OTLP gRPC
+      - "4317:4317"  # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:16686"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merch-network
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merch-network
+
+  grafana:
+    image: grafana/grafana:10.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - merch-network
 
 volumes:
   postgres_data:
+  grafana_data:
+
+networks:
+  merch-network:
+    driver: bridge

@@ -42,17 +42,22 @@ func main() {
 	merchRepo := core.NewPostgresMerchRepository(db)
 	transactionRepo := core.NewPostgresTransactionRepository(db)
 	redisClient := redis.NewClient(os.Getenv("REDIS_ADDR"))
-	kafkaProducer := kafka.NewProducer([]string{os.Getenv("KAFKA_BROKER")}, "transactions")
-	defer kafkaProducer.Close()
+	kafkaProducerTransactions := kafka.NewProducer([]string{os.Getenv("KAFKA_BROKER")}, "transactions")
+	kafkaProducerUsers := kafka.NewProducer([]string{os.Getenv("KAFKA_BROKER")}, "users")
+	defer kafkaProducerTransactions.Close()
+	defer kafkaProducerUsers.Close() // Исправлено: добавлены скобки
 	jwtSecret := os.Getenv("JWT_SECRET")
 
 	// Инициализируем сервис
-	svc := service.NewMerchService(userRepo, merchRepo, transactionRepo, redisClient, kafkaProducer, jwtSecret)
+	svc := service.NewMerchService(userRepo, merchRepo, transactionRepo, redisClient, kafkaProducerUsers, kafkaProducerTransactions, jwtSecret)
 
-	// Настраиваем Kafka-консьюмер
-	consumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "transactions", "merch-service-group", userRepo, transactionRepo)
-	go consumer.Consume(context.Background())
-	defer consumer.Close()
+	// Настраиваем Kafka-консьюмеры
+	transactionConsumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "transactions", "merch-service-group", userRepo, transactionRepo)
+	userConsumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "users", "merch-service-group-users", userRepo, transactionRepo)
+	go transactionConsumer.Consume(context.Background())
+	go userConsumer.Consume(context.Background())
+	defer transactionConsumer.Close()
+	defer userConsumer.Close()
 
 	// Настраиваем роутер
 	mux := api.SetupRouter(svc, redisClient, jwtSecret)

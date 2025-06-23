@@ -10,9 +10,17 @@ import (
 	"github.com/honeynil/MerchServiceTochka-main/internal/infrastructure/auth"
 	"github.com/honeynil/MerchServiceTochka-main/internal/infrastructure/redis"
 	service "github.com/honeynil/MerchServiceTochka-main/internal/services"
+	"github.com/honeynil/MerchServiceTochka-main/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Response — структура для единообразных ответов
+type Response struct {
+	Status  string      `json:"status"`
+	Message string      `json:"message,omitempty"`
+	Data    interface{} `json:"data,omitempty"`
+}
 
 var (
 	RequestCounter = prometheus.NewCounterVec(
@@ -46,7 +54,6 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 			endpoint := r.URL.Path
 			method := r.Method
 
-			// Записываем ответ для получения статуса
 			recorder := &statusRecorder{ResponseWriter: w}
 			next.ServeHTTP(recorder, r)
 
@@ -56,124 +63,268 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		}
 	}
 
+	// Хелпер для отправки JSON-ответа
+	sendResponse := func(w http.ResponseWriter, statusCode int, resp Response) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			slog.Error("failed to encode response", "error", err)
+		}
+	}
+
+	// Хелпер для обработки ошибок
+	handleError := func(w http.ResponseWriter, err error, defaultMsg string, defaultStatus int) {
+		var statusCode int
+		var message string
+
+		switch err {
+		case errors.ErrUsernameExists:
+			statusCode = http.StatusConflict
+			message = "Username already exists"
+		case errors.ErrInvalidCredentials:
+			statusCode = http.StatusUnauthorized
+			message = "Invalid username or password"
+		case errors.ErrMerchNotFound:
+			statusCode = http.StatusNotFound
+			message = "Merch not found"
+		case errors.ErrInsufficientFunds:
+			statusCode = http.StatusBadRequest
+			message = "Insufficient funds"
+		case errors.ErrUserNotFound:
+			statusCode = http.StatusNotFound
+			message = "User not found"
+		default:
+			statusCode = defaultStatus
+			message = defaultMsg
+		}
+
+		sendResponse(w, statusCode, Response{
+			Status:  "error",
+			Message: message,
+		})
+	}
+
 	// Роуты
 	mux.HandleFunc("/register", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendResponse(w, http.StatusMethodNotAllowed, Response{
+				Status:  "error",
+				Message: "Method not allowed",
+			})
 			return
 		}
+
 		var req struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Invalid request body",
+			})
 			return
 		}
+
+		if req.Username == "" || req.Password == "" {
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Username and password are required",
+			})
+			return
+		}
+
 		eventID, err := svc.Register(r.Context(), req.Username, req.Password)
 		if err != nil {
 			slog.Error("register failed", "username", req.Username, "error", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			handleError(w, err, "Failed to register user", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintf(w, `"%s"`, eventID)
+
+		slog.Info("user registered", "username", req.Username, "event_id", eventID)
+		sendResponse(w, http.StatusCreated, Response{
+			Status:  "success",
+			Message: "User created successfully",
+			Data:    map[string]string{"event_id": eventID},
+		})
 	}))
 
 	mux.HandleFunc("/login", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendResponse(w, http.StatusMethodNotAllowed, Response{
+				Status:  "error",
+				Message: "Method not allowed",
+			})
 			return
 		}
+
 		var req struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Invalid request body",
+			})
 			return
 		}
+
 		token, err := svc.Login(r.Context(), req.Username, req.Password)
 		if err != nil {
 			slog.Error("login failed", "username", req.Username, "error", err)
-			http.Error(w, err.Error(), http.StatusUnauthorized)
+			handleError(w, err, "Failed to login", http.StatusUnauthorized)
 			return
 		}
-		fmt.Fprintf(w, `"%s"`, token)
+
+		slog.Info("user logged in", "username", req.Username)
+		sendResponse(w, http.StatusOK, Response{
+			Status:  "success",
+			Message: "Login successful",
+			Data:    map[string]string{"token": token},
+		})
 	}))
 
 	// Защищённые роуты с JWT
 	authHandler := auth.AuthMiddleware(redisClient, jwtSecret)
 	mux.Handle("/buy", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendResponse(w, http.StatusMethodNotAllowed, Response{
+				Status:  "error",
+				Message: "Method not allowed",
+			})
 			return
 		}
+
 		userID := r.Context().Value("user_id").(int32)
 		var req struct {
 			MerchID int32 `json:"merch_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Invalid request body",
+			})
 			return
 		}
+
+		if req.MerchID <= 0 {
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Invalid merch ID",
+			})
+			return
+		}
+
 		if err := svc.BuyMerch(r.Context(), userID, req.MerchID); err != nil {
 			slog.Error("buy failed", "user_id", userID, "merch_id", req.MerchID, "error", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			handleError(w, err, "Failed to purchase merch", http.StatusBadRequest)
 			return
 		}
-		w.Write([]byte("{}"))
+
+		slog.Info("merch purchased", "user_id", userID, "merch_id", req.MerchID)
+		sendResponse(w, http.StatusOK, Response{
+			Status:  "success",
+			Message: "Merch purchased successfully",
+		})
 	})))
 
 	mux.Handle("/transfer", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendResponse(w, http.StatusMethodNotAllowed, Response{
+				Status:  "error",
+				Message: "Method not allowed",
+			})
 			return
 		}
+
 		userID := r.Context().Value("user_id").(int32)
 		var req struct {
 			ToUserID int32 `json:"to_user_id"`
 			Amount   int32 `json:"amount"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Invalid request body",
+			})
 			return
 		}
+
+		if req.ToUserID <= 0 {
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Invalid receiver ID",
+			})
+			return
+		}
+		if req.Amount <= 0 {
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Amount must be positive",
+			})
+			return
+		}
+
 		if err := svc.Transfer(r.Context(), userID, req.ToUserID, req.Amount); err != nil {
 			slog.Error("transfer failed", "from_user_id", userID, "to_user_id", req.ToUserID, "error", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			handleError(w, err, "Failed to transfer funds", http.StatusBadRequest)
 			return
 		}
-		w.Write([]byte("{}"))
+
+		slog.Info("transfer completed", "from_user_id", userID, "to_user_id", req.ToUserID, "amount", req.Amount)
+		sendResponse(w, http.StatusOK, Response{
+			Status:  "success",
+			Message: "Transfer completed successfully",
+		})
 	})))
 
 	mux.Handle("/balance", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendResponse(w, http.StatusMethodNotAllowed, Response{
+				Status:  "error",
+				Message: "Method not allowed",
+			})
 			return
 		}
+
 		userID := r.Context().Value("user_id").(int32)
 		balance, err := svc.GetBalance(r.Context(), userID)
 		if err != nil {
 			slog.Error("get balance failed", "user_id", userID, "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			handleError(w, err, "Failed to get balance", http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]int32{"balance": balance})
+
+		slog.Info("balance retrieved", "user_id", userID, "balance", balance)
+		sendResponse(w, http.StatusOK, Response{
+			Status: "success",
+			Data:   map[string]int32{"balance": balance},
+		})
 	})))
 
 	mux.Handle("/history", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendResponse(w, http.StatusMethodNotAllowed, Response{
+				Status:  "error",
+				Message: "Method not allowed",
+			})
 			return
 		}
+
 		userID := r.Context().Value("user_id").(int32)
 		history, err := svc.GetTransactionHistory(r.Context(), userID)
 		if err != nil {
 			slog.Error("get history failed", "user_id", userID, "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			handleError(w, err, "Failed to get transaction history", http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(history)
+
+		slog.Info("transaction history retrieved", "user_id", userID, "count", len(history))
+		sendResponse(w, http.StatusOK, Response{
+			Status: "success",
+			Data:   history,
+		})
 	})))
 
 	mux.Handle("/metrics", promhttp.Handler())

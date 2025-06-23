@@ -139,7 +139,6 @@ func (r *PostgresTransactionRepository) GetByID(ctx context.Context, id int32) (
 	slog.Info("transaction retrieved", "method", "GetByID", "transaction_id", id, "user_id", tx.UserID, "type", tx.Type)
 	return &tx, nil
 }
-
 func (r *PostgresTransactionRepository) GetBalance(ctx context.Context, userID int32) (int32, error) {
 	var err error
 	tracer := otel.Tracer("transaction-repository")
@@ -160,18 +159,7 @@ func (r *PostgresTransactionRepository) GetBalance(ctx context.Context, userID i
 	}()
 
 	var balance int32
-	query := `
-		SELECT COALESCE(SUM(
-			CASE
-				WHEN type = 'purchase' AND status = 'completed' THEN -amount
-				WHEN type = 'transfer' AND status = 'completed' AND user_id = $1 THEN -amount
-				WHEN type = 'transfer' AND status = 'completed' AND related_id = $1 THEN amount
-				ELSE 0
-			END
-		), 0) as balance
-		FROM transactions
-		WHERE user_id = $1 OR related_id = $1
-	`
+	query := `SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = $1 AND status = 'completed' AND type IN ('purchase', 'transfer', 'initial')`
 	err = r.db.QueryRowContext(ctx, query, userID).Scan(&balance)
 	if err != nil {
 		slog.Error("failed to get balance", "method", "GetBalance", "user_id", userID, "error", err)
@@ -181,6 +169,7 @@ func (r *PostgresTransactionRepository) GetBalance(ctx context.Context, userID i
 	slog.Info("balance retrieved", "method", "GetBalance", "user_id", userID, "balance", balance)
 	return balance, nil
 }
+
 func (r *PostgresTransactionRepository) GetTransactionHistory(ctx context.Context, userID int32) ([]models.Transaction, error) {
 	var err error
 	tracer := otel.Tracer("transaction-repository")

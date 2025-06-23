@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/segmentio/kafka-go"
@@ -20,16 +21,18 @@ type Producer struct {
 
 func NewProducer(brokers []string, topic string) *Producer {
 	writer := &kafka.Writer{
-		Addr:     kafka.TCP(brokers...),
-		Topic:    topic,
-		Balancer: &kafka.LeastBytes{},
+		Addr:         kafka.TCP(brokers...),
+		Balancer:     &kafka.LeastBytes{},
+		Async:        true,
+		RequiredAcks: kafka.RequireOne,
 	}
 	return &Producer{writer: writer}
 }
 
 func (p *Producer) Send(ctx context.Context, topic string, key int64, value []byte) error {
 	msg := kafka.Message{
-		Key:   []byte(string(key)),
+		Topic: topic,
+		Key:   []byte(fmt.Sprintf("%d", key)),
 		Value: value,
 	}
 	if err := p.writer.WriteMessages(ctx, msg); err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/honeynil/MerchServiceTochka-main/internal/repository"
 	pkgerrors "github.com/honeynil/MerchServiceTochka-main/pkg/errors"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -29,12 +30,13 @@ type MerchService interface {
 }
 
 type merchService struct {
-	userRepo        repository.UserRepository
-	merchRepo       repository.MerchRepository
-	transactionRepo repository.TransactionRepository
-	redisClient     redis.RedisClient
-	kafkaProducer   kafka.KafkaProducer
-	jwtSecret       string
+	userRepo                  repository.UserRepository
+	merchRepo                 repository.MerchRepository
+	transactionRepo           repository.TransactionRepository
+	redisClient               redis.RedisClient
+	kafkaProducerUsers        *kafka.Producer
+	kafkaProducerTransactions *kafka.Producer
+	jwtSecret                 string
 }
 
 func NewMerchService(
@@ -42,20 +44,116 @@ func NewMerchService(
 	merchRepo repository.MerchRepository,
 	transactionRepo repository.TransactionRepository,
 	redisClient redis.RedisClient,
-	kafkaProducer kafka.KafkaProducer,
+	kafkaProducerUsers *kafka.Producer,
+	kafkaProducerTransactions *kafka.Producer,
 	jwtSecret string,
-) MerchService {
+) *merchService {
 	return &merchService{
-		userRepo:        userRepo,
-		merchRepo:       merchRepo,
-		transactionRepo: transactionRepo,
-		redisClient:     redisClient,
-		kafkaProducer:   kafkaProducer,
-		jwtSecret:       jwtSecret,
+		userRepo:                  userRepo,
+		merchRepo:                 merchRepo,
+		transactionRepo:           transactionRepo,
+		redisClient:               redisClient,
+		kafkaProducerUsers:        kafkaProducerUsers,
+		kafkaProducerTransactions: kafkaProducerTransactions,
+		jwtSecret:                 jwtSecret,
 	}
 }
 
-// Остальной код остаётся без изменений (Login, Register, BuyMerch, Transfer, GetBalance, GetTransactionHistory)
+func (s *merchService) Register(ctx context.Context, username, password string) (string, error) {
+	tracer := otel.Tracer("merch-service")
+	ctx, span := tracer.Start(ctx, "Register")
+	defer span.End()
+
+	// Валидация входных данных
+	if username == "" || password == "" {
+		span.SetStatus(codes.Error, "empty username or password")
+		return "", pkgerrors.ErrInvalidInput
+	}
+
+	// Хеширование пароля
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "password hashing failed")
+		slog.Error("failed to hash password",
+			"username", username,
+			"error", err)
+		return "", fmt.Errorf("%w: failed to hash password", pkgerrors.ErrInternal)
+	}
+
+	// Проверка существования пользователя
+	existingUser, err := s.userRepo.GetByUsername(ctx, username)
+	if existingUser != nil {
+		span.SetStatus(codes.Error, "username already exists")
+		slog.Warn("username already exists",
+			"username", username,
+			"existing_id", existingUser.ID)
+		return "", pkgerrors.ErrUsernameExists
+	}
+	if err != nil && !stderrors.Is(err, pkgerrors.ErrUserNotFound) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "user check failed")
+		slog.Error("failed to check user existence",
+			"username", username,
+			"error", err)
+		return "", fmt.Errorf("%w: failed to check user existence", pkgerrors.ErrInternal)
+	}
+
+	// Создание пользователя в БД
+	user := &models.User{
+		Username:     username,
+		PasswordHash: string(hash),
+		Balance:      1000, // Начальный баланс
+	}
+
+	if err := s.userRepo.Create(ctx, user); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "user creation failed")
+		slog.Error("failed to create user in DB",
+			"username", username,
+			"error", err)
+		return "", fmt.Errorf("%w: failed to create user", pkgerrors.ErrInternal)
+	}
+
+	// Подготовка события для Kafka
+	event := map[string]interface{}{
+		"event_type": "user_registered",
+		"user_id":    user.ID,
+		"username":   username,
+		"created_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		span.RecordError(err)
+		slog.Error("failed to marshal kafka event",
+			"user_id", user.ID,
+			"error", err)
+		// Не прерываем регистрацию из-за ошибки сериализации
+	} else {
+		// Асинхронная отправка в Kafka с 3 попытками
+		go func() {
+			retries := 3
+			for i := 0; i < retries; i++ {
+				if err := s.kafkaProducerUsers.Send(context.Background(), "users", int64(user.ID), eventBytes); err == nil {
+					slog.Info("user registration event sent",
+						"user_id", user.ID,
+						"username", username)
+					return
+				}
+				time.Sleep(time.Second * time.Duration(i+1))
+			}
+			slog.Error("failed to send user registration event after retries",
+				"user_id", user.ID,
+				"username", username)
+		}()
+	}
+
+	slog.Info("user registered successfully",
+		"user_id", user.ID,
+		"username", username)
+
+	return fmt.Sprintf("%d", user.ID), nil
+}
 
 func (s *merchService) Login(ctx context.Context, username, password string) (string, error) {
 	tracer := otel.Tracer("merch-service")
@@ -89,48 +187,6 @@ func (s *merchService) Login(ctx context.Context, username, password string) (st
 
 	slog.Info("user logged in", "username", username, "user_id", user.ID)
 	return tokenString, nil
-}
-
-func (s *merchService) Register(ctx context.Context, username, password string) (string, error) {
-	tracer := otel.Tracer("merch-service")
-	ctx, span := tracer.Start(ctx, "Register")
-	defer span.End()
-
-	if username == "" || password == "" {
-		return "", fmt.Errorf("username and password are required")
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		slog.Error("failed to hash password", "error", err)
-		return "", fmt.Errorf("failed to hash password: %w", err)
-	}
-
-	_, err = s.userRepo.GetByUsername(ctx, username)
-	if err == nil {
-		slog.Error("username already exists", "username", username)
-		return "", pkgerrors.ErrUsernameExists
-	}
-
-	event := map[string]interface{}{
-		"username":      username,
-		"password_hash": string(hash),
-		"balance":       0,
-		"created_at":    time.Now().UTC().Format(time.RFC3339),
-	}
-	eventBytes, err := json.Marshal(event)
-	if err != nil {
-		slog.Error("failed to marshal Kafka event", "error", err)
-		return "", fmt.Errorf("failed to marshal Kafka event: %w", err)
-	}
-	eventID := time.Now().UnixNano()
-	if err := s.kafkaProducer.Send(ctx, "users", eventID, eventBytes); err != nil {
-		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
-		return "", fmt.Errorf("failed to send Kafka event: %w", err)
-	}
-
-	slog.Info("register event sent", "username", username, "event_id", eventID)
-	return fmt.Sprintf("%d", eventID), nil
 }
 
 func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32) error {
@@ -214,7 +270,7 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32) erro
 		return fmt.Errorf("failed to marshal Kafka event: %w", err)
 	}
 	eventID := time.Now().UnixNano()
-	if err := s.kafkaProducer.Send(ctx, "transactions", eventID, eventBytes); err != nil {
+	if err := s.kafkaProducerTransactions.Send(ctx, "transactions", eventID, eventBytes); err != nil {
 		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
 		return fmt.Errorf("failed to send Kafka event: %w", err)
 	}
@@ -289,7 +345,7 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 		return fmt.Errorf("failed to marshal Kafka event: %w", err)
 	}
 	eventID := time.Now().UnixNano()
-	if err := s.kafkaProducer.Send(ctx, "transactions", eventID, eventBytes); err != nil {
+	if err := s.kafkaProducerTransactions.Send(ctx, "transactions", eventID, eventBytes); err != nil {
 		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
 		return fmt.Errorf("failed to send Kafka event: %w", err)
 	}
@@ -303,12 +359,12 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 	slog.Info("transfer event sent", "from_user_id", fromUserID, "to_user_id", toUserID, "event_id", eventID)
 	return nil
 }
-
 func (s *merchService) GetBalance(ctx context.Context, userID int32) (int32, error) {
 	tracer := otel.Tracer("merch-service")
 	ctx, span := tracer.Start(ctx, "GetBalance")
 	defer span.End()
 
+	slog.Info("Getting balance", "user_id", userID) // Лог входа
 	balanceKey := fmt.Sprintf("user:%d:balance", userID)
 	balanceStr, err := s.redisClient.Get(ctx, balanceKey)
 	if err != nil && !stderrors.Is(err, redis.ErrKeyNotFound) {
@@ -316,13 +372,17 @@ func (s *merchService) GetBalance(ctx context.Context, userID int32) (int32, err
 		return 0, err
 	}
 	if stderrors.Is(err, redis.ErrKeyNotFound) {
+		slog.Info("Balance not found in Redis, fetching from Postgres", "user_id", userID)
 		balance, err := s.transactionRepo.GetBalance(ctx, userID)
 		if err != nil {
-			slog.Error("failed to get balance", "user_id", userID, "error", err)
+			slog.Error("failed to get balance from Postgres", "user_id", userID, "error", err)
 			return 0, err
 		}
+		slog.Info("Balance fetched from Postgres", "user_id", userID, "balance", balance)
 		if err := s.redisClient.Set(ctx, balanceKey, balance, time.Minute); err != nil {
 			slog.Error("failed to cache balance", "user_id", userID, "error", err)
+		} else {
+			slog.Info("Balance cached in Redis", "user_id", userID, "balance", balance)
 		}
 		return balance, nil
 	}
@@ -332,6 +392,7 @@ func (s *merchService) GetBalance(ctx context.Context, userID int32) (int32, err
 		slog.Error("failed to unmarshal balance", "user_id", userID, "error", err)
 		return 0, err
 	}
+	slog.Info("Balance fetched from Redis", "user_id", userID, "balance", balance)
 	return balance, nil
 }
 

@@ -82,6 +82,19 @@ func (r *PostgresUserRepository) Create(ctx context.Context, user *models.User) 
 		return fmt.Errorf("failed to create user: %w", err)
 	}
 
+	// Создаём начальную транзакцию
+	_, err = dbTx.ExecContext(ctx,
+		"INSERT INTO transactions (user_id, type, status, amount, created_at) VALUES ($1, $2, $3, $4, $5)",
+		userID, "initial", "completed", user.Balance, time.Now())
+	if err != nil {
+		if rbErr := dbTx.Rollback(); rbErr != nil {
+			err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
+			slog.Error("rollback failed", "method", "Create", "error", rbErr)
+		}
+		slog.Error("failed to create initial transaction", "method", "Create", "user_id", userID, "error", err)
+		return fmt.Errorf("failed to create initial transaction: %w", err)
+	}
+
 	if err = dbTx.Commit(); err != nil {
 		slog.Error("failed to commit transaction", "method", "Create", "error", err)
 		return fmt.Errorf("failed to commit transaction: %w", err)
