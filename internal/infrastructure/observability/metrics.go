@@ -1,10 +1,7 @@
 package observability
 
 import (
-	"net/http"
-
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -30,8 +27,4 @@ var (
 
 func InitMetrics() {
 	prometheus.MustRegister(RepositoryCalls, RepositoryDuration)
-	http.Handle("/metrics", promhttp.Handler())
-	go func() {
-		http.ListenAndServe(":9090", nil)
-	}()
 }

@@ -1,6 +1,9 @@
 package errors
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	ErrUserNotFound                    = errors.New("user not found")
@@ -14,4 +17,8 @@ var (
 	ErrInvalidTransactionStatus        = errors.New("invalid transaction status")
 	ErrTransactionNotFound             = errors.New("transaction not found")
 	ErrUserNotFoundOrInsufficientFunds = errors.New("user not found or insufficient funds")
+	ErrInvalidCredentials              = fmt.Errorf("invalid credentials")
+	ErrUsernameExists                  = fmt.Errorf("username already exists")
+	ErrInternal                        = fmt.Errorf("error to create user")
+	ErrInvalidInput                    = fmt.Errorf("ErrInvalidInput")
 )

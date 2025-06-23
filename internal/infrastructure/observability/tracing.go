@@ -13,7 +13,7 @@ import (
 
 func InitTracing(serviceName string) func(context.Context) error {
 	exporter, err := otlptracehttp.New(context.Background(),
-		otlptracehttp.WithEndpoint("localhost:4318"),
+		otlptracehttp.WithEndpoint("jaeger:4318"),
 		otlptracehttp.WithInsecure(),
 	)
 	if err != nil {
