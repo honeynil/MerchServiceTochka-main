@@ -23,7 +23,7 @@ import (
 type MerchService interface {
 	Login(ctx context.Context, username, password string) (string, error)
 	Register(ctx context.Context, username, password string) (string, error)
-	BuyMerch(ctx context.Context, userID, merchID int32) error
+	BuyMerch(ctx context.Context, userID, merchID int32, requestID string) error
 	Transfer(ctx context.Context, fromUserID, toUserID, amount int32) error
 	GetBalance(ctx context.Context, userID int32) (int32, error)
 	GetTransactionHistory(ctx context.Context, userID int32) ([]models.Transaction, error)
@@ -189,35 +189,53 @@ func (s *merchService) Login(ctx context.Context, username, password string) (st
 	return tokenString, nil
 }
 
-func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32) error {
+func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requestID string) error {
 	tracer := otel.Tracer("merch-service")
 	ctx, span := tracer.Start(ctx, "BuyMerch")
 	defer span.End()
 
+	// Проверяем идемпотентность
+	requestKey := fmt.Sprintf("request:%s", requestID)
+	if _, err := s.redisClient.Get(ctx, requestKey); err == nil {
+		slog.Error("request already processed", "request_id", requestID, "user_id", userID)
+		span.SetStatus(codes.Error, "request already processed")
+		return pkgerrors.ErrRequestAlreadyProcessed
+	}
+
+	// Получаем данные о мерче
 	merchKey := fmt.Sprintf("merch:%d", merchID)
 	var merch *models.Merch
 	merchJSON, err := s.redisClient.Get(ctx, merchKey)
 	if err != nil && !stderrors.Is(err, redis.ErrKeyNotFound) {
 		slog.Error("failed to get merch from Redis", "merch_id", merchID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to get merch from Redis")
 		return err
 	}
 	if stderrors.Is(err, redis.ErrKeyNotFound) {
 		merch, err = s.merchRepo.GetByID(ctx, merchID)
 		if err != nil {
 			slog.Error("merch not found", "merch_id", merchID, "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "merch not found")
 			return err
 		}
 		merchBytes, err := json.Marshal(merch)
 		if err != nil {
 			slog.Error("failed to marshal merch", "merch_id", merchID, "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to marshal merch")
 			return err
 		}
 		if err := s.redisClient.Set(ctx, merchKey, string(merchBytes), time.Hour); err != nil {
 			slog.Error("failed to cache merch", "merch_id", merchID, "error", err)
+			span.RecordError(err)
 		}
 	} else {
 		if err := json.Unmarshal([]byte(merchJSON), &merch); err != nil {
 			slog.Error("failed to unmarshal merch", "merch_id", merchID, "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to unmarshal merch")
 			return err
 		}
 	}
@@ -225,61 +243,60 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32) erro
 	price, err := s.merchRepo.GetPrice(ctx, merchID)
 	if err != nil {
 		slog.Error("failed to get merch price", "merch_id", merchID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to get merch price")
 		return err
 	}
 
-	balanceKey := fmt.Sprintf("user:%d:balance", userID)
-	balanceStr, err := s.redisClient.Get(ctx, balanceKey)
-	var balance int32
-	if err != nil && !stderrors.Is(err, redis.ErrKeyNotFound) {
-		slog.Error("failed to get balance from Redis", "user_id", userID, "error", err)
+	// Проверяем баланс
+	balance, err := s.userRepo.GetBalance(ctx, userID)
+	if err != nil {
+		slog.Error("failed to get balance from Postgres", "user_id", userID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to get balance")
 		return err
-	}
-	if stderrors.Is(err, redis.ErrKeyNotFound) {
-		balance, err = s.transactionRepo.GetBalance(ctx, userID)
-		if err != nil {
-			slog.Error("failed to get balance", "user_id", userID, "error", err)
-			return err
-		}
-		if err := s.redisClient.Set(ctx, balanceKey, balance, time.Minute); err != nil {
-			slog.Error("failed to cache balance", "user_id", userID, "error", err)
-		}
-	} else {
-		if err := json.Unmarshal([]byte(balanceStr), &balance); err != nil {
-			slog.Error("failed to unmarshal balance", "user_id", userID, "error", err)
-			return err
-		}
 	}
 
 	if balance < price {
 		slog.Error("insufficient funds", "user_id", userID, "balance", balance, "price", price)
+		span.SetStatus(codes.Error, "insufficient funds")
 		return pkgerrors.ErrInsufficientFunds
 	}
 
+	// Отправляем событие в Kafka
 	event := map[string]interface{}{
 		"user_id":    userID,
 		"merch_id":   merchID,
 		"amount":     -price,
 		"type":       "purchase",
-		"status":     "pending",
+		"status":     "completed",
 		"created_at": time.Now().UTC().Format(time.RFC3339),
+		"request_id": requestID, // Добавляем request_id в событие
 	}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
 		slog.Error("failed to marshal Kafka event", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal event")
 		return fmt.Errorf("failed to marshal Kafka event: %w", err)
 	}
 	eventID := time.Now().UnixNano()
 	if err := s.kafkaProducerTransactions.Send(ctx, "transactions", eventID, eventBytes); err != nil {
+		// Удаляем request_id из Redis в случае ошибки Kafka
+		s.redisClient.Del(ctx, requestKey)
 		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to send Kafka event")
 		return fmt.Errorf("failed to send Kafka event: %w", err)
 	}
 
-	if err := s.redisClient.Del(ctx, balanceKey); err != nil {
+	// Инвалидируем кэш баланса
+	if err := s.redisClient.Del(ctx, fmt.Sprintf("user:%d:balance", userID)); err != nil {
 		slog.Error("failed to invalidate balance cache", "user_id", userID, "error", err)
+		span.RecordError(err)
 	}
 
-	slog.Info("buy event sent", "user_id", userID, "merch_id", merchID, "event_id", eventID)
+	slog.Info("buy event sent", "user_id", userID, "merch_id", merchID, "event_id", eventID, "request_id", requestID)
 	return nil
 }
 
@@ -289,45 +306,38 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 	defer span.End()
 
 	if amount <= 0 {
+		slog.Error("invalid transfer amount", "amount", amount)
+		span.SetStatus(codes.Error, "invalid amount")
 		return fmt.Errorf("amount must be positive")
 	}
 
 	_, err := s.userRepo.GetByID(ctx, fromUserID)
 	if err != nil {
 		slog.Error("sender not found", "user_id", fromUserID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "sender not found")
 		return err
 	}
-	_, err = s.userRepo.GetByID(ctx, toUserID)
+	_, err = s.userRepo.GetByID(ctx, toUserID) // Исправлено: ToUserID → GetByID
 	if err != nil {
 		slog.Error("receiver not found", "user_id", toUserID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "receiver not found")
 		return err
 	}
 
-	balanceKey := fmt.Sprintf("user:%d:balance", fromUserID)
-	balanceStr, err := s.redisClient.Get(ctx, balanceKey)
-	var balance int32
-	if err != nil && !stderrors.Is(err, redis.ErrKeyNotFound) {
-		slog.Error("failed to get balance from Redis", "user_id", fromUserID, "error", err)
+	// Используем userRepo.GetBalance вместо transactionRepo.GetBalance
+	balance, err := s.userRepo.GetBalance(ctx, fromUserID)
+	if err != nil {
+		slog.Error("failed to get balance from Postgres", "user_id", fromUserID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to get balance")
 		return err
-	}
-	if stderrors.Is(err, redis.ErrKeyNotFound) {
-		balance, err = s.transactionRepo.GetBalance(ctx, fromUserID)
-		if err != nil {
-			slog.Error("failed to get balance", "user_id", fromUserID, "error", err)
-			return err
-		}
-		if err := s.redisClient.Set(ctx, balanceKey, balance, time.Minute); err != nil {
-			slog.Error("failed to cache balance", "user_id", fromUserID, "error", err)
-		}
-	} else {
-		if err := json.Unmarshal([]byte(balanceStr), &balance); err != nil {
-			slog.Error("failed to unmarshal balance", "user_id", fromUserID, "error", err)
-			return err
-		}
 	}
 
 	if balance < amount {
 		slog.Error("insufficient funds", "user_id", fromUserID, "balance", balance, "amount", amount)
+		span.SetStatus(codes.Error, "insufficient funds")
 		return pkgerrors.ErrInsufficientFunds
 	}
 
@@ -336,66 +346,67 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 		"to_user_id":   toUserID,
 		"amount":       amount,
 		"type":         "transfer",
-		"status":       "pending",
+		"status":       "completed",
 		"created_at":   time.Now().UTC().Format(time.RFC3339),
 	}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
 		slog.Error("failed to marshal Kafka event", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal event")
 		return fmt.Errorf("failed to marshal Kafka event: %w", err)
 	}
 	eventID := time.Now().UnixNano()
 	if err := s.kafkaProducerTransactions.Send(ctx, "transactions", eventID, eventBytes); err != nil {
 		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to send Kafka event")
 		return fmt.Errorf("failed to send Kafka event: %w", err)
 	}
 
 	for _, userID := range []int32{fromUserID, toUserID} {
 		if err := s.redisClient.Del(ctx, fmt.Sprintf("user:%d:balance", userID)); err != nil {
 			slog.Error("failed to invalidate balance cache", "user_id", userID, "error", err)
+			span.RecordError(err)
 		}
 	}
 
 	slog.Info("transfer event sent", "from_user_id", fromUserID, "to_user_id", toUserID, "event_id", eventID)
 	return nil
 }
+
 func (s *merchService) GetBalance(ctx context.Context, userID int32) (int32, error) {
 	tracer := otel.Tracer("merch-service")
 	ctx, span := tracer.Start(ctx, "GetBalance")
 	defer span.End()
 
-	slog.Info("Getting balance", "user_id", userID) // Лог входа
+	slog.Info("Getting balance", "user_id", userID)
 	balanceKey := fmt.Sprintf("user:%d:balance", userID)
 	balanceStr, err := s.redisClient.Get(ctx, balanceKey)
-	if err != nil && !stderrors.Is(err, redis.ErrKeyNotFound) {
-		slog.Error("failed to get balance from Redis", "user_id", userID, "error", err)
-		return 0, err
-	}
-	if stderrors.Is(err, redis.ErrKeyNotFound) {
-		slog.Info("Balance not found in Redis, fetching from Postgres", "user_id", userID)
-		balance, err := s.transactionRepo.GetBalance(ctx, userID)
-		if err != nil {
-			slog.Error("failed to get balance from Postgres", "user_id", userID, "error", err)
-			return 0, err
-		}
-		slog.Info("Balance fetched from Postgres", "user_id", userID, "balance", balance)
-		if err := s.redisClient.Set(ctx, balanceKey, balance, time.Minute); err != nil {
-			slog.Error("failed to cache balance", "user_id", userID, "error", err)
+	if err == nil {
+		var balance int32
+		if err := json.Unmarshal([]byte(balanceStr), &balance); err != nil {
+			slog.Error("failed to unmarshal balance", "user_id", userID, "error", err)
 		} else {
-			slog.Info("Balance cached in Redis", "user_id", userID, "balance", balance)
+			slog.Info("Balance fetched from Redis", "user_id", userID, "balance", balance)
+			return balance, nil
 		}
-		return balance, nil
 	}
 
-	var balance int32
-	if err := json.Unmarshal([]byte(balanceStr), &balance); err != nil {
-		slog.Error("failed to unmarshal balance", "user_id", userID, "error", err)
-		return 0, err
+	// Читаем баланс из users.balance
+	balance, err := s.userRepo.GetBalance(ctx, userID)
+	if err != nil {
+		slog.Error("failed to get balance from Postgres", "user_id", userID, "error", err)
+		return 0, fmt.Errorf("failed to get balance: %w", err)
 	}
-	slog.Info("Balance fetched from Redis", "user_id", userID, "balance", balance)
+
+	if err := s.redisClient.Set(ctx, balanceKey, balance, time.Minute); err != nil {
+		slog.Error("failed to cache balance", "user_id", userID, "error", err)
+	}
+
+	slog.Info("Balance fetched from Postgres", "user_id", userID, "balance", balance)
 	return balance, nil
 }
-
 func (s *merchService) GetTransactionHistory(ctx context.Context, userID int32) ([]models.Transaction, error) {
 	tracer := otel.Tracer("merch-service")
 	ctx, span := tracer.Start(ctx, "GetTransactionHistory")

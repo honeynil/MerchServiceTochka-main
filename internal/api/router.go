@@ -93,6 +93,12 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		case errors.ErrUserNotFound:
 			statusCode = http.StatusNotFound
 			message = "User not found"
+		case errors.ErrRequestAlreadyProcessed:
+			statusCode = http.StatusConflict
+			message = "Request already processed"
+		case errors.ErrBalanceLocked:
+			statusCode = http.StatusTooManyRequests
+			message = "User balance is being processed"
 		default:
 			statusCode = defaultStatus
 			message = defaultMsg
@@ -198,7 +204,8 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 
 		userID := r.Context().Value("user_id").(int32)
 		var req struct {
-			MerchID int32 `json:"merch_id"`
+			MerchID   int32  `json:"merch_id"`
+			RequestID string `json:"request_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			sendResponse(w, http.StatusBadRequest, Response{
@@ -216,16 +223,24 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 			return
 		}
 
-		if err := svc.BuyMerch(r.Context(), userID, req.MerchID); err != nil {
-			slog.Error("buy failed", "user_id", userID, "merch_id", req.MerchID, "error", err)
+		if req.RequestID == "" {
+			sendResponse(w, http.StatusBadRequest, Response{
+				Status:  "error",
+				Message: "Request ID is required",
+			})
+			return
+		}
+
+		if err := svc.BuyMerch(r.Context(), userID, req.MerchID, req.RequestID); err != nil {
+			slog.Error("buy failed", "user_id", userID, "merch_id", req.MerchID, "request_id", req.RequestID, "error", err)
 			handleError(w, err, "Failed to purchase merch", http.StatusBadRequest)
 			return
 		}
 
-		slog.Info("merch purchased", "user_id", userID, "merch_id", req.MerchID)
-		sendResponse(w, http.StatusOK, Response{
+		slog.Info("merch purchased", "user_id", userID, "merch_id", req.MerchID, "request_id", req.RequestID)
+		sendResponse(w, http.StatusAccepted, Response{
 			Status:  "success",
-			Message: "Merch purchased successfully",
+			Message: "Merch purchase accepted",
 		})
 	})))
 
@@ -273,7 +288,7 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		}
 
 		slog.Info("transfer completed", "from_user_id", userID, "to_user_id", req.ToUserID, "amount", req.Amount)
-		sendResponse(w, http.StatusOK, Response{
+		sendResponse(w, http.StatusAccepted, Response{
 			Status:  "success",
 			Message: "Transfer completed successfully",
 		})

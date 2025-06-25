@@ -97,24 +97,36 @@ func (h *Handler) BuyMerch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		MerchID int32 `json:"merch_id"`
+		MerchID   int32  `json:"merch_id"`
+		RequestID string `json:"request_id"` // Новый обязательный параметр
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	err := h.service.BuyMerch(r.Context(), userID, req.MerchID)
+	if req.RequestID == "" {
+		h.writeError(w, http.StatusBadRequest, errors.New("request_id is required"))
+		return
+	}
+
+	err := h.service.BuyMerch(r.Context(), userID, req.MerchID, req.RequestID)
 	if err != nil {
-		if errors.Is(err, pkgerrors.ErrInsufficientFunds) {
+		if errors.Is(err, pkgerrors.ErrRequestAlreadyProcessed) {
+			h.writeError(w, http.StatusConflict, err)
+		} else if errors.Is(err, pkgerrors.ErrInsufficientFunds) {
 			h.writeError(w, http.StatusBadRequest, err)
+		} else if errors.Is(err, pkgerrors.ErrMerchNotFound) {
+			h.writeError(w, http.StatusNotFound, err)
 		} else {
 			h.writeError(w, http.StatusInternalServerError, err)
 		}
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
@@ -137,13 +149,17 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, pkgerrors.ErrInsufficientFunds) {
 			h.writeError(w, http.StatusBadRequest, err)
+		} else if errors.Is(err, pkgerrors.ErrUserNotFound) {
+			h.writeError(w, http.StatusNotFound, err)
 		} else {
 			h.writeError(w, http.StatusInternalServerError, err)
 		}
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted) // 202 Accepted для асинхронной обработки
+	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 
 func (h *Handler) GetBalance(w http.ResponseWriter, r *http.Request) {

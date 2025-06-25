@@ -164,6 +164,18 @@ func (r *PostgresUserRepository) ChangeBalance(ctx context.Context, userID, amou
 	return newBalance, nil
 }
 
+func (r *PostgresUserRepository) GetBalance(ctx context.Context, userID int32) (int32, error) {
+	var balance int32
+	query := `SELECT balance FROM users WHERE id = $1`
+	err := r.db.QueryRowContext(ctx, query, userID).Scan(&balance)
+	if err != nil {
+		slog.Error("failed to get balance", "user_id", userID, "error", err)
+		return 0, fmt.Errorf("failed to get balance: %w", err)
+	}
+	slog.Info("balance retrieved", "user_id", userID, "balance", balance)
+	return balance, nil
+}
+
 func (r *PostgresUserRepository) GetByID(ctx context.Context, id int32) (*models.User, error) {
 	var err error
 	tracer := otel.Tracer("user-repository")

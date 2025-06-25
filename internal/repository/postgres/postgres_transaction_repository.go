@@ -60,12 +60,6 @@ func (r *PostgresTransactionRepository) Create(ctx context.Context, tx *models.T
 		return 0, err
 	}
 
-	if tx.Amount <= 0 {
-		err = fmt.Errorf("amount must be positive")
-		slog.Error("amount must be positive", "method", "Create", "amount", tx.Amount, "error", err)
-		return 0, err
-	}
-
 	span.SetAttributes(
 		attribute.Int("user_id", int(tx.UserID)),
 		attribute.Int("related_id", int(tx.RelatedID)),
