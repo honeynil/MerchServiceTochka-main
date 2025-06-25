@@ -21,4 +21,6 @@ var (
 	ErrUsernameExists                  = fmt.Errorf("username already exists")
 	ErrInternal                        = fmt.Errorf("error to create user")
 	ErrInvalidInput                    = fmt.Errorf("ErrInvalidInput")
+	ErrRequestAlreadyProcessed         = fmt.Errorf("request alredy processed")
+	ErrBalanceLocked                   = fmt.Errorf("user balance is being processed")
 )

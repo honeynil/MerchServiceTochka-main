@@ -45,15 +45,15 @@ func main() {
 	kafkaProducerTransactions := kafka.NewProducer([]string{os.Getenv("KAFKA_BROKER")}, "transactions")
 	kafkaProducerUsers := kafka.NewProducer([]string{os.Getenv("KAFKA_BROKER")}, "users")
 	defer kafkaProducerTransactions.Close()
-	defer kafkaProducerUsers.Close() // Исправлено: добавлены скобки
+	defer kafkaProducerUsers.Close()
 	jwtSecret := os.Getenv("JWT_SECRET")
 
 	// Инициализируем сервис
 	svc := service.NewMerchService(userRepo, merchRepo, transactionRepo, redisClient, kafkaProducerUsers, kafkaProducerTransactions, jwtSecret)
 
 	// Настраиваем Kafka-консьюмеры
-	transactionConsumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "transactions", "merch-service-group", userRepo, transactionRepo)
-	userConsumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "users", "merch-service-group-users", userRepo, transactionRepo)
+	transactionConsumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "transactions", "merch-service-group", userRepo, transactionRepo, redisClient)
+	userConsumer := kafka.NewConsumer([]string{os.Getenv("KAFKA_BROKER")}, "users", "merch-service-group-users", userRepo, transactionRepo, redisClient)
 	go transactionConsumer.Consume(context.Background())
 	go userConsumer.Consume(context.Background())
 	defer transactionConsumer.Close()

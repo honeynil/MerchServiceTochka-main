@@ -13,5 +13,7 @@ type UserRepository interface {
 	GetByUsername(ctx context.Context, username string) (*models.User, error)
 
 	// Управление балансом
+
 	ChangeBalance(ctx context.Context, userID, delta int32) (newBalance int32, err error)
+	GetBalance(ctx context.Context, userID int32) (int32, error)
 }
