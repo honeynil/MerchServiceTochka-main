@@ -15,7 +15,6 @@ type Config struct {
 }
 
 func Load() *Config {
-	// Load .env file
 	if err := godotenv.Load(); err != nil {
 		slog.Warn("failed to load .env file, using default values", "error", err)
 	}
@@ -27,7 +26,6 @@ func Load() *Config {
 		JWTSecret:    os.Getenv("JWT_SECRET"),
 	}
 
-	// Fallback values
 	if cfg.PostgresDSN == "" {
 		cfg.PostgresDSN = "host=localhost user=postgres password=postgres dbname=merch sslmode=disable"
 	}

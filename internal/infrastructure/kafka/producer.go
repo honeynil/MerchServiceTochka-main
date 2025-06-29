@@ -8,13 +8,11 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// KafkaProducer defines the interface for Kafka producer operations.
 type KafkaProducer interface {
 	Send(ctx context.Context, topic string, key int64, value []byte) error
 	Close() error
 }
 
-// Producer is the implementation of KafkaProducer.
 type Producer struct {
 	writer *kafka.Writer
 }
@@ -36,12 +34,18 @@ func (p *Producer) Send(ctx context.Context, topic string, key int64, value []by
 		Value: value,
 	}
 	if err := p.writer.WriteMessages(ctx, msg); err != nil {
-		slog.Error("failed to send Kafka message", "topic", topic, "error", err)
+		slog.Error("failed to send Kafka message", "topic", topic, "key", key, "error", err)
 		return err
 	}
+	slog.Info("Kafka message sent", "topic", topic, "key", key)
 	return nil
 }
 
 func (p *Producer) Close() error {
-	return p.writer.Close()
+	if err := p.writer.Close(); err != nil {
+		slog.Error("failed to close Kafka writer", "error", err)
+		return err
+	}
+	slog.Info("Kafka writer closed")
+	return nil
 }

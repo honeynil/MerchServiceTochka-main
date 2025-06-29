@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,13 +17,18 @@ func AuthMiddleware(redisClient redis.RedisClient, jwtSecret string) func(http.H
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
-				http.Error(w, "authorization header missing", http.StatusUnauthorized)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "authorization header missing"})
 				return
 			}
 
 			parts := strings.Split(authHeader, " ")
+
 			if len(parts) != 2 || parts[0] != "Bearer" {
-				http.Error(w, "invalid authorization header", http.StatusUnauthorized)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid authorization header"})
 				return
 			}
 
@@ -35,28 +41,36 @@ func AuthMiddleware(redisClient redis.RedisClient, jwtSecret string) func(http.H
 			})
 
 			if err != nil || !token.Valid {
-				http.Error(w, "invalid token", http.StatusUnauthorized)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
 				return
 			}
 
 			claims, ok := token.Claims.(jwt.MapClaims)
 			if !ok {
-				http.Error(w, "invalid token claims", http.StatusUnauthorized)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid token claims"})
 				return
 			}
 
 			userID, ok := claims["user_id"].(float64)
 			if !ok {
-				http.Error(w, "invalid user_id in token", http.StatusUnauthorized)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid user_id in token"})
 				return
 			}
 
-			// Check token in Redis
 			redisKey := fmt.Sprintf("user:%d:token", int32(userID))
 			storedToken, err := redisClient.Get(r.Context(), redisKey)
 			if err != nil || storedToken != tokenStr {
 				slog.Error("invalid or revoked token", "user_id", userID, "error", err)
-				http.Error(w, "invalid or revoked token", http.StatusUnauthorized)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid or revoked token"})
 				return
 			}
 

@@ -1,5 +1,6 @@
-/*
 package service
+
+/*
 import (
 
 	"context"
@@ -296,4 +297,3 @@ import (
 		})
 	}
 */
-package service

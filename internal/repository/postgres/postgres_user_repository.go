@@ -82,7 +82,6 @@ func (r *PostgresUserRepository) Create(ctx context.Context, user *models.User) 
 		return fmt.Errorf("failed to create user: %w", err)
 	}
 
-	// Создаём начальную транзакцию
 	_, err = dbTx.ExecContext(ctx,
 		"INSERT INTO transactions (user_id, type, status, amount, created_at) VALUES ($1, $2, $3, $4, $5)",
 		userID, "initial", "completed", user.Balance, time.Now())
@@ -109,23 +108,8 @@ func (r *PostgresUserRepository) ChangeBalance(ctx context.Context, userID, amou
 	var err error
 	tracer := otel.Tracer("user-repository")
 	ctx, span := tracer.Start(ctx, "ChangeBalance")
-	span.SetAttributes(
-		attribute.Int("user_id", int(userID)),
-		attribute.Int("amount", int(amount)),
-	)
+	span.SetAttributes(attribute.Int("user_id", int(userID)), attribute.Int("amount", int(amount)))
 	defer span.End()
-
-	start := time.Now()
-	defer func() {
-		status := "success"
-		if err != nil {
-			status = "error"
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		observability.RepositoryCalls.WithLabelValues("ChangeBalance", status).Inc()
-		observability.RepositoryDuration.WithLabelValues("ChangeBalance").Observe(time.Since(start).Seconds())
-	}()
 
 	dbTx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -133,25 +117,28 @@ func (r *PostgresUserRepository) ChangeBalance(ctx context.Context, userID, amou
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	query := `
-		UPDATE users
-		SET balance = balance + $1
-		WHERE id = $2 AND (balance + $1) >= 0
-		RETURNING balance
-	`
+	var currentBalance int32
+	err = dbTx.QueryRowContext(ctx, "SELECT balance FROM users WHERE id = $1 FOR UPDATE", userID).Scan(&currentBalance)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			dbTx.Rollback()
+			return 0, pkgerrors.ErrUserNotFound
+		}
+		dbTx.Rollback()
+		return 0, fmt.Errorf("failed to lock row: %w", err)
+	}
+
+	if currentBalance+amount < 0 {
+		dbTx.Rollback()
+		return 0, pkgerrors.ErrInsufficientFunds
+	}
+
+	query := `UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance`
 	var newBalance int32
 	err = dbTx.QueryRowContext(ctx, query, amount, userID).Scan(&newBalance)
 	if err != nil {
-		if rbErr := dbTx.Rollback(); rbErr != nil {
-			err = fmt.Errorf("rollback failed: %v; original error: %w", rbErr, err)
-			slog.Error("rollback failed", "method", "ChangeBalance", "error", rbErr)
-		} else {
-			slog.Error("failed to update balance", "method", "ChangeBalance", "user_id", userID, "error", err)
-		}
-		if err == sql.ErrNoRows {
-			err = pkgerrors.ErrUserNotFoundOrInsufficientFunds
-			slog.Error("user not found or insufficient funds", "method", "ChangeBalance", "user_id", userID, "amount", amount, "error", err)
-		}
+		dbTx.Rollback()
+		slog.Error("failed to update balance", "method", "ChangeBalance", "user_id", userID, "error", err)
 		return 0, fmt.Errorf("failed to update balance: %w", err)
 	}
 
