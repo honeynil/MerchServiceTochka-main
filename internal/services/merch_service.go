@@ -69,16 +69,6 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 		return "", pkgerrors.ErrInvalidInput
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "password hashing failed")
-		slog.Error("failed to hash password",
-			"username", username,
-			"error", err)
-		return "", fmt.Errorf("%w: failed to hash password", pkgerrors.ErrInternal)
-	}
-
 	existingUser, err := s.userRepo.GetByUsername(ctx, username)
 	if existingUser != nil {
 		span.SetStatus(codes.Error, "username already exists")
@@ -94,6 +84,16 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 			"username", username,
 			"error", err)
 		return "", fmt.Errorf("%w: failed to check user existence", pkgerrors.ErrInternal)
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "password hashing failed")
+		slog.Error("failed to hash password",
+			"username", username,
+			"error", err)
+		return "", fmt.Errorf("%w: failed to hash password", pkgerrors.ErrInternal)
 	}
 
 	user := &models.User{
