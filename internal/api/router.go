@@ -7,15 +7,15 @@ import (
 	"net/http"
 	"time"
 
+	pkgerrors "github.com/honeynil/MerchServiceTochka-main/pkg/errors"
+
 	"github.com/honeynil/MerchServiceTochka-main/internal/infrastructure/auth"
 	"github.com/honeynil/MerchServiceTochka-main/internal/infrastructure/redis"
 	service "github.com/honeynil/MerchServiceTochka-main/internal/services"
-	"github.com/honeynil/MerchServiceTochka-main/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Response — структура для единообразных ответов
 type Response struct {
 	Status  string      `json:"status"`
 	Message string      `json:"message,omitempty"`
@@ -47,7 +47,6 @@ func init() {
 func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSecret string) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Middleware для метрик
 	metricsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
@@ -63,7 +62,6 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		}
 	}
 
-	// Хелпер для отправки JSON-ответа
 	sendResponse := func(w http.ResponseWriter, statusCode int, resp Response) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(statusCode)
@@ -72,31 +70,30 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		}
 	}
 
-	// Хелпер для обработки ошибок
 	handleError := func(w http.ResponseWriter, err error, defaultMsg string, defaultStatus int) {
 		var statusCode int
 		var message string
 
 		switch err {
-		case errors.ErrUsernameExists:
+		case pkgerrors.ErrUsernameExists:
 			statusCode = http.StatusConflict
 			message = "Username already exists"
-		case errors.ErrInvalidCredentials:
+		case pkgerrors.ErrInvalidCredentials:
 			statusCode = http.StatusUnauthorized
 			message = "Invalid username or password"
-		case errors.ErrMerchNotFound:
+		case pkgerrors.ErrMerchNotFound:
 			statusCode = http.StatusNotFound
 			message = "Merch not found"
-		case errors.ErrInsufficientFunds:
+		case pkgerrors.ErrInsufficientFunds:
 			statusCode = http.StatusBadRequest
-			message = "Insufficient funds"
-		case errors.ErrUserNotFound:
+			message = "Insufficient funds, please top up your balance"
+		case pkgerrors.ErrUserNotFound:
 			statusCode = http.StatusNotFound
 			message = "User not found"
-		case errors.ErrRequestAlreadyProcessed:
+		case pkgerrors.ErrRequestAlreadyProcessed:
 			statusCode = http.StatusConflict
 			message = "Request already processed"
-		case errors.ErrBalanceLocked:
+		case pkgerrors.ErrBalanceLocked:
 			statusCode = http.StatusTooManyRequests
 			message = "User balance is being processed"
 		default:
@@ -110,7 +107,6 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		})
 	}
 
-	// Роуты
 	mux.HandleFunc("/register", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendResponse(w, http.StatusMethodNotAllowed, Response{
@@ -191,7 +187,6 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		})
 	}))
 
-	// Защищённые роуты с JWT
 	authHandler := auth.AuthMiddleware(redisClient, jwtSecret)
 	mux.Handle("/buy", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -293,7 +288,6 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 			Message: "Transfer completed successfully",
 		})
 	})))
-
 	mux.Handle("/balance", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			sendResponse(w, http.StatusMethodNotAllowed, Response{
@@ -303,7 +297,24 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 			return
 		}
 
-		userID := r.Context().Value("user_id").(int32)
+		userIDInterface := r.Context().Value("user_id")
+		if userIDInterface == nil {
+			sendResponse(w, http.StatusUnauthorized, Response{
+				Status:  "error",
+				Message: "User not authenticated",
+			})
+			return
+		}
+
+		userID, ok := userIDInterface.(int32)
+		if !ok {
+			sendResponse(w, http.StatusInternalServerError, Response{
+				Status:  "error",
+				Message: "Invalid user ID type",
+			})
+			return
+		}
+
 		balance, err := svc.GetBalance(r.Context(), userID)
 		if err != nil {
 			slog.Error("get balance failed", "user_id", userID, "error", err)
@@ -317,7 +328,6 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 			Data:   map[string]int32{"balance": balance},
 		})
 	})))
-
 	mux.Handle("/history", authHandler(metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			sendResponse(w, http.StatusMethodNotAllowed, Response{
@@ -342,11 +352,23 @@ func SetupRouter(svc service.MerchService, redisClient redis.RedisClient, jwtSec
 		})
 	})))
 
+	mux.HandleFunc("/health", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+		})
+	}))
+
 	mux.Handle("/metrics", promhttp.Handler())
 	return mux
 }
 
-// statusRecorder для захвата статуса ответа
 type statusRecorder struct {
 	http.ResponseWriter
 	status int

@@ -98,7 +98,7 @@ func (h *Handler) BuyMerch(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		MerchID   int32  `json:"merch_id"`
-		RequestID string `json:"request_id"` // Новый обязательный параметр
+		RequestID string `json:"request_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeError(w, http.StatusBadRequest, err)
@@ -158,7 +158,7 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted) // 202 Accepted для асинхронной обработки
+	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 

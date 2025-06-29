@@ -1,7 +1,7 @@
 package models
 
 type Merch struct {
-	ID    int32
-	Price int32
-	Name  string
+	ID    int32  `json:"id"`
+	Price int32  `json:"price"`
+	Name  string `json:"name"`
 }

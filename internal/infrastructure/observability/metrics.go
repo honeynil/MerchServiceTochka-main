@@ -5,7 +5,6 @@ import (
 )
 
 var (
-	// Счётчик вызовов методов репозитория
 	RepositoryCalls = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "repository_calls_total",
@@ -14,7 +13,6 @@ var (
 		[]string{"method", "status"},
 	)
 
-	// Гистограмма времени выполнения запросов
 	RepositoryDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "repository_duration_seconds",

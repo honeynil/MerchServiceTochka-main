@@ -3,13 +3,15 @@ package kafka
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"time"
+
+	stderrors "errors"
 
 	"github.com/honeynil/MerchServiceTochka-main/internal/infrastructure/redis"
 	"github.com/honeynil/MerchServiceTochka-main/internal/models"
 	"github.com/honeynil/MerchServiceTochka-main/internal/repository"
+	pkgerrors "github.com/honeynil/MerchServiceTochka-main/pkg/errors"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -107,21 +109,26 @@ func (c *Consumer) Consume(ctx context.Context) {
 					continue
 				}
 
-				// Проверяем идемпотентность
-				requestKey := fmt.Sprintf("request:%s", event.RequestID)
-				if _, err := c.redisClient.Get(ctx, requestKey); err == nil {
-					slog.Info("purchase already processed", "request_id", event.RequestID, "user_id", event.UserID)
+				balance, err := c.userRepo.GetBalance(ctx, event.UserID)
+				if err != nil {
+					if stderrors.Is(err, pkgerrors.ErrUserNotFound) {
+						slog.Info("user not found, skipping transaction", "user_id", event.UserID)
+						continue
+					}
+					slog.Error("failed to get balance", "user_id", event.UserID, "error", err)
+					continue
+				}
+				if balance < -event.Amount {
+					slog.Info("insufficient funds, skipping transaction", "user_id", event.UserID, "balance", balance, "amount", -event.Amount)
 					continue
 				}
 
-				// Обновляем баланс
-				_, err := c.userRepo.ChangeBalance(ctx, event.UserID, event.Amount)
+				_, err = c.userRepo.ChangeBalance(ctx, event.UserID, event.Amount)
 				if err != nil {
 					slog.Error("failed to update balance", "user_id", event.UserID, "error", err)
 					continue
 				}
 
-				// Создаем транзакцию
 				transaction := &models.Transaction{
 					UserID:    event.UserID,
 					RelatedID: event.MerchID,
@@ -130,47 +137,42 @@ func (c *Consumer) Consume(ctx context.Context) {
 					Status:    models.StatusCompleted,
 					CreatedAt: createdAt,
 				}
-
-				transactionID, err := c.transactionRepo.Create(ctx, transaction)
+				_, err = c.transactionRepo.Create(ctx, transaction)
 				if err != nil {
 					slog.Error("failed to create transaction", "user_id", event.UserID, "error", err)
 					continue
 				}
 
-				// Сохраняем request_id
-				if err := c.redisClient.Set(ctx, requestKey, "processed", 24*time.Hour); err != nil {
-					slog.Error("failed to set request_id in Redis", "request_id", event.RequestID, "error", err)
-				}
-
-				// Снимаем блокировку
-				lockKey := fmt.Sprintf("user:%d:lock", event.UserID)
-				if err := c.redisClient.Del(ctx, lockKey); err != nil {
-					slog.Error("failed to remove lock", "user_id", event.UserID, "error", err)
-				}
-
-				slog.Info("purchase processed", "user_id", event.UserID, "merch_id", event.MerchID, "transaction_id", transactionID, "request_id", event.RequestID)
+				slog.Info("purchase processed", "user_id", event.UserID, "merch_id", event.MerchID)
 
 			case string(models.TypeTransfer):
-				if event.FromUserID == 0 || event.ToUserID == 0 {
-					slog.Error("invalid transfer event: missing from_user_id or to_user_id")
+				if event.FromUserID == 0 || event.ToUserID == 0 || event.RequestID == "" {
+					slog.Error("invalid transfer event: missing from_user_id, to_user_id, or request_id")
 					continue
 				}
 
-				// Вычитаем у отправителя
-				_, err := c.userRepo.ChangeBalance(ctx, event.FromUserID, -event.Amount)
+				balance, err := c.userRepo.GetBalance(ctx, event.FromUserID)
+				if err != nil {
+					slog.Error("failed to get sender balance", "user_id", event.FromUserID, "error", err)
+					continue
+				}
+				if balance < event.Amount {
+					slog.Error("insufficient funds", "user_id", event.FromUserID, "balance", balance, "amount", event.Amount)
+					continue
+				}
+
+				_, err = c.userRepo.ChangeBalance(ctx, event.FromUserID, -event.Amount)
 				if err != nil {
 					slog.Error("failed to update sender balance", "user_id", event.FromUserID, "error", err)
 					continue
 				}
 
-				// Добавляем получателю
 				_, err = c.userRepo.ChangeBalance(ctx, event.ToUserID, event.Amount)
 				if err != nil {
 					slog.Error("failed to update receiver balance", "user_id", event.ToUserID, "error", err)
 					continue
 				}
 
-				// Транзакция для отправителя
 				senderTransaction := &models.Transaction{
 					UserID:    event.FromUserID,
 					RelatedID: event.ToUserID,
@@ -179,13 +181,12 @@ func (c *Consumer) Consume(ctx context.Context) {
 					Status:    models.StatusCompleted,
 					CreatedAt: createdAt,
 				}
-				senderTransactionID, err := c.transactionRepo.Create(ctx, senderTransaction)
+				_, err = c.transactionRepo.Create(ctx, senderTransaction)
 				if err != nil {
 					slog.Error("failed to create sender transaction", "user_id", event.FromUserID, "error", err)
 					continue
 				}
 
-				// Транзакция для получателя
 				receiverTransaction := &models.Transaction{
 					UserID:    event.ToUserID,
 					RelatedID: event.FromUserID,
@@ -194,22 +195,13 @@ func (c *Consumer) Consume(ctx context.Context) {
 					Status:    models.StatusCompleted,
 					CreatedAt: createdAt,
 				}
-				receiverTransactionID, err := c.transactionRepo.Create(ctx, receiverTransaction)
+				_, err = c.transactionRepo.Create(ctx, receiverTransaction)
 				if err != nil {
 					slog.Error("failed to create receiver transaction", "user_id", event.ToUserID, "error", err)
 					continue
 				}
 
-				// Снимаем блокировку для обоих пользователей
-				for _, userID := range []int32{event.FromUserID, event.ToUserID} {
-					lockKey := fmt.Sprintf("user:%d:lock", userID)
-					if err := c.redisClient.Del(ctx, lockKey); err != nil {
-						slog.Error("failed to remove lock", "user_id", userID, "error", err)
-					}
-				}
-
-				slog.Info("transfer processed", "from_user_id", event.FromUserID, "to_user_id", event.ToUserID, "sender_transaction_id", senderTransactionID, "receiver_transaction_id", receiverTransactionID)
-
+				slog.Info("transfer processed", "from_user_id", event.FromUserID, "to_user_id", event.ToUserID)
 			default:
 				slog.Error("unknown transaction type", "type", event.Type)
 				continue
@@ -219,5 +211,10 @@ func (c *Consumer) Consume(ctx context.Context) {
 }
 
 func (c *Consumer) Close() error {
-	return c.reader.Close()
+	if err := c.reader.Close(); err != nil {
+		slog.Error("failed to close Kafka reader", "error", err)
+		return err
+	}
+	slog.Info("Kafka reader closed")
+	return nil
 }

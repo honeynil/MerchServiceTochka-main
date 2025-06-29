@@ -6,11 +6,11 @@ import (
 )
 
 type User struct {
-	ID           int32
-	Balance      int32
-	Username     string
-	PasswordHash string
-	CreatedAt    time.Time
+	ID           int32     `json:"id"`
+	Balance      int32     `json:"balance"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 func (u *User) Validate() error {

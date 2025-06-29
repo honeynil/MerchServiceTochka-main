@@ -64,13 +64,11 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 	ctx, span := tracer.Start(ctx, "Register")
 	defer span.End()
 
-	// Валидация входных данных
 	if username == "" || password == "" {
 		span.SetStatus(codes.Error, "empty username or password")
 		return "", pkgerrors.ErrInvalidInput
 	}
 
-	// Хеширование пароля
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		span.RecordError(err)
@@ -81,7 +79,6 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 		return "", fmt.Errorf("%w: failed to hash password", pkgerrors.ErrInternal)
 	}
 
-	// Проверка существования пользователя
 	existingUser, err := s.userRepo.GetByUsername(ctx, username)
 	if existingUser != nil {
 		span.SetStatus(codes.Error, "username already exists")
@@ -99,11 +96,10 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 		return "", fmt.Errorf("%w: failed to check user existence", pkgerrors.ErrInternal)
 	}
 
-	// Создание пользователя в БД
 	user := &models.User{
 		Username:     username,
 		PasswordHash: string(hash),
-		Balance:      1000, // Начальный баланс
+		Balance:      5000,
 	}
 
 	if err := s.userRepo.Create(ctx, user); err != nil {
@@ -115,12 +111,12 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 		return "", fmt.Errorf("%w: failed to create user", pkgerrors.ErrInternal)
 	}
 
-	// Подготовка события для Kafka
 	event := map[string]interface{}{
-		"event_type": "user_registered",
-		"user_id":    user.ID,
-		"username":   username,
-		"created_at": time.Now().UTC().Format(time.RFC3339),
+		"event_type":    "user_registered",
+		"user_id":       user.ID,
+		"username":      username,
+		"password_hash": string(hash),
+		"created_at":    time.Now().UTC().Format(time.RFC3339),
 	}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
@@ -128,9 +124,7 @@ func (s *merchService) Register(ctx context.Context, username, password string) 
 		slog.Error("failed to marshal kafka event",
 			"user_id", user.ID,
 			"error", err)
-		// Не прерываем регистрацию из-за ошибки сериализации
 	} else {
-		// Асинхронная отправка в Kafka с 3 попытками
 		go func() {
 			retries := 3
 			for i := 0; i < retries; i++ {
@@ -194,19 +188,42 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requ
 	ctx, span := tracer.Start(ctx, "BuyMerch")
 	defer span.End()
 
-	// Проверяем идемпотентность
 	requestKey := fmt.Sprintf("request:%s", requestID)
-	if _, err := s.redisClient.Get(ctx, requestKey); err == nil {
-		slog.Error("request already processed", "request_id", requestID, "user_id", userID)
+	if val, err := s.redisClient.Get(ctx, requestKey); err == nil {
+		slog.Error("request already processed", "request_id", requestID, "user_id", userID, "status", val)
 		span.SetStatus(codes.Error, "request already processed")
 		return pkgerrors.ErrRequestAlreadyProcessed
 	}
 
-	// Получаем данные о мерче
+	if err := s.redisClient.Set(ctx, requestKey, "pending", 24*time.Hour); err != nil {
+		slog.Error("failed to set request key", "request_id", requestID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to set request key")
+		return err
+	}
+
+	lockKey := fmt.Sprintf("user:%d:lock", userID)
+	ok, err := s.redisClient.SetNX(ctx, lockKey, "locked", 3*time.Second)
+	if err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		slog.Error("failed to acquire lock", "user_id", userID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to acquire lock")
+		return pkgerrors.ErrBalanceLocked
+	}
+	if !ok {
+		s.redisClient.Del(ctx, requestKey)
+		slog.Error("balance is locked", "user_id", userID)
+		span.SetStatus(codes.Error, "balance is locked")
+		return pkgerrors.ErrBalanceLocked
+	}
+
 	merchKey := fmt.Sprintf("merch:%d", merchID)
 	var merch *models.Merch
 	merchJSON, err := s.redisClient.Get(ctx, merchKey)
 	if err != nil && !stderrors.Is(err, redis.ErrKeyNotFound) {
+		s.redisClient.Del(ctx, requestKey)
+		s.redisClient.Del(ctx, lockKey)
 		slog.Error("failed to get merch from Redis", "merch_id", merchID, "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to get merch from Redis")
@@ -215,6 +232,8 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requ
 	if stderrors.Is(err, redis.ErrKeyNotFound) {
 		merch, err = s.merchRepo.GetByID(ctx, merchID)
 		if err != nil {
+			s.redisClient.Del(ctx, requestKey)
+			s.redisClient.Del(ctx, lockKey)
 			slog.Error("merch not found", "merch_id", merchID, "error", err)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "merch not found")
@@ -222,17 +241,21 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requ
 		}
 		merchBytes, err := json.Marshal(merch)
 		if err != nil {
+			s.redisClient.Del(ctx, requestKey)
+			s.redisClient.Del(ctx, lockKey)
 			slog.Error("failed to marshal merch", "merch_id", merchID, "error", err)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "failed to marshal merch")
 			return err
 		}
-		if err := s.redisClient.Set(ctx, merchKey, string(merchBytes), time.Hour); err != nil {
+		if err := s.redisClient.Set(ctx, merchKey, string(merchBytes), 24*time.Hour); err != nil {
 			slog.Error("failed to cache merch", "merch_id", merchID, "error", err)
 			span.RecordError(err)
 		}
 	} else {
 		if err := json.Unmarshal([]byte(merchJSON), &merch); err != nil {
+			s.redisClient.Del(ctx, requestKey)
+			s.redisClient.Del(ctx, lockKey)
 			slog.Error("failed to unmarshal merch", "merch_id", merchID, "error", err)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "failed to unmarshal merch")
@@ -242,15 +265,18 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requ
 
 	price, err := s.merchRepo.GetPrice(ctx, merchID)
 	if err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		s.redisClient.Del(ctx, lockKey)
 		slog.Error("failed to get merch price", "merch_id", merchID, "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to get merch price")
 		return err
 	}
 
-	// Проверяем баланс
 	balance, err := s.userRepo.GetBalance(ctx, userID)
 	if err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		s.redisClient.Del(ctx, lockKey)
 		slog.Error("failed to get balance from Postgres", "user_id", userID, "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to get balance")
@@ -258,23 +284,26 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requ
 	}
 
 	if balance < price {
+		s.redisClient.Del(ctx, requestKey)
+		s.redisClient.Del(ctx, lockKey)
 		slog.Error("insufficient funds", "user_id", userID, "balance", balance, "price", price)
 		span.SetStatus(codes.Error, "insufficient funds")
 		return pkgerrors.ErrInsufficientFunds
 	}
 
-	// Отправляем событие в Kafka
 	event := map[string]interface{}{
 		"user_id":    userID,
 		"merch_id":   merchID,
 		"amount":     -price,
 		"type":       "purchase",
-		"status":     "completed",
+		"status":     "pending",
 		"created_at": time.Now().UTC().Format(time.RFC3339),
-		"request_id": requestID, // Добавляем request_id в событие
+		"request_id": requestID,
 	}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		s.redisClient.Del(ctx, lockKey)
 		slog.Error("failed to marshal Kafka event", "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to marshal event")
@@ -282,18 +311,12 @@ func (s *merchService) BuyMerch(ctx context.Context, userID, merchID int32, requ
 	}
 	eventID := time.Now().UnixNano()
 	if err := s.kafkaProducerTransactions.Send(ctx, "transactions", eventID, eventBytes); err != nil {
-		// Удаляем request_id из Redis в случае ошибки Kafka
 		s.redisClient.Del(ctx, requestKey)
+		s.redisClient.Del(ctx, lockKey)
 		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to send Kafka event")
 		return fmt.Errorf("failed to send Kafka event: %w", err)
-	}
-
-	// Инвалидируем кэш баланса
-	if err := s.redisClient.Del(ctx, fmt.Sprintf("user:%d:balance", userID)); err != nil {
-		slog.Error("failed to invalidate balance cache", "user_id", userID, "error", err)
-		span.RecordError(err)
 	}
 
 	slog.Info("buy event sent", "user_id", userID, "merch_id", merchID, "event_id", eventID, "request_id", requestID)
@@ -318,7 +341,7 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 		span.SetStatus(codes.Error, "sender not found")
 		return err
 	}
-	_, err = s.userRepo.GetByID(ctx, toUserID) // Исправлено: ToUserID → GetByID
+	_, err = s.userRepo.GetByID(ctx, toUserID)
 	if err != nil {
 		slog.Error("receiver not found", "user_id", toUserID, "error", err)
 		span.RecordError(err)
@@ -326,9 +349,54 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 		return err
 	}
 
-	// Используем userRepo.GetBalance вместо transactionRepo.GetBalance
+	requestID := fmt.Sprintf("%d-%d-%d-%d", fromUserID, toUserID, amount, time.Now().UnixNano())
+	requestKey := fmt.Sprintf("request:%s", requestID)
+	if _, err := s.redisClient.Get(ctx, requestKey); err == nil {
+		slog.Error("transfer already processed", "request_id", requestID, "from_user_id", fromUserID)
+		span.SetStatus(codes.Error, "transfer already processed")
+		return pkgerrors.ErrRequestAlreadyProcessed
+	}
+
+	if err := s.redisClient.Set(ctx, requestKey, "pending", 24*time.Hour); err != nil {
+		slog.Error("failed to set request key", "request_id", requestID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to set request key")
+		return err
+	}
+
+	lockKeys := []string{
+		fmt.Sprintf("user:%d:lock", fromUserID),
+		fmt.Sprintf("user:%d:lock", toUserID),
+	}
+	for _, lockKey := range lockKeys {
+		ok, err := s.redisClient.SetNX(ctx, lockKey, "locked", 3*time.Second)
+		if err != nil {
+			s.redisClient.Del(ctx, requestKey)
+			for _, lk := range lockKeys {
+				s.redisClient.Del(ctx, lk)
+			}
+			slog.Error("failed to acquire lock", "lock_key", lockKey, "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to acquire lock")
+			return pkgerrors.ErrBalanceLocked
+		}
+		if !ok {
+			s.redisClient.Del(ctx, requestKey)
+			for _, lk := range lockKeys {
+				s.redisClient.Del(ctx, lk)
+			}
+			slog.Error("balance is locked", "lock_key", lockKey)
+			span.SetStatus(codes.Error, "balance is locked")
+			return pkgerrors.ErrBalanceLocked
+		}
+	}
+
 	balance, err := s.userRepo.GetBalance(ctx, fromUserID)
 	if err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		for _, lk := range lockKeys {
+			s.redisClient.Del(ctx, lk)
+		}
 		slog.Error("failed to get balance from Postgres", "user_id", fromUserID, "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to get balance")
@@ -336,6 +404,10 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 	}
 
 	if balance < amount {
+		s.redisClient.Del(ctx, requestKey)
+		for _, lk := range lockKeys {
+			s.redisClient.Del(ctx, lk)
+		}
 		slog.Error("insufficient funds", "user_id", fromUserID, "balance", balance, "amount", amount)
 		span.SetStatus(codes.Error, "insufficient funds")
 		return pkgerrors.ErrInsufficientFunds
@@ -346,11 +418,16 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 		"to_user_id":   toUserID,
 		"amount":       amount,
 		"type":         "transfer",
-		"status":       "completed",
+		"status":       "pending",
 		"created_at":   time.Now().UTC().Format(time.RFC3339),
+		"request_id":   requestID,
 	}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		for _, lk := range lockKeys {
+			s.redisClient.Del(ctx, lk)
+		}
 		slog.Error("failed to marshal Kafka event", "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to marshal event")
@@ -358,20 +435,17 @@ func (s *merchService) Transfer(ctx context.Context, fromUserID, toUserID, amoun
 	}
 	eventID := time.Now().UnixNano()
 	if err := s.kafkaProducerTransactions.Send(ctx, "transactions", eventID, eventBytes); err != nil {
+		s.redisClient.Del(ctx, requestKey)
+		for _, lk := range lockKeys {
+			s.redisClient.Del(ctx, lk)
+		}
 		slog.Error("failed to send Kafka event", "event_id", eventID, "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to send Kafka event")
 		return fmt.Errorf("failed to send Kafka event: %w", err)
 	}
 
-	for _, userID := range []int32{fromUserID, toUserID} {
-		if err := s.redisClient.Del(ctx, fmt.Sprintf("user:%d:balance", userID)); err != nil {
-			slog.Error("failed to invalidate balance cache", "user_id", userID, "error", err)
-			span.RecordError(err)
-		}
-	}
-
-	slog.Info("transfer event sent", "from_user_id", fromUserID, "to_user_id", toUserID, "event_id", eventID)
+	slog.Info("transfer event sent", "from_user_id", fromUserID, "to_user_id", toUserID, "event_id", eventID, "request_id", requestID)
 	return nil
 }
 
@@ -393,20 +467,20 @@ func (s *merchService) GetBalance(ctx context.Context, userID int32) (int32, err
 		}
 	}
 
-	// Читаем баланс из users.balance
 	balance, err := s.userRepo.GetBalance(ctx, userID)
 	if err != nil {
 		slog.Error("failed to get balance from Postgres", "user_id", userID, "error", err)
 		return 0, fmt.Errorf("failed to get balance: %w", err)
 	}
 
-	if err := s.redisClient.Set(ctx, balanceKey, balance, time.Minute); err != nil {
+	if err := s.redisClient.Set(ctx, balanceKey, balance, 5*time.Minute); err != nil {
 		slog.Error("failed to cache balance", "user_id", userID, "error", err)
 	}
 
 	slog.Info("Balance fetched from Postgres", "user_id", userID, "balance", balance)
 	return balance, nil
 }
+
 func (s *merchService) GetTransactionHistory(ctx context.Context, userID int32) ([]models.Transaction, error) {
 	tracer := otel.Tracer("merch-service")
 	ctx, span := tracer.Start(ctx, "GetTransactionHistory")

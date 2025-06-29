@@ -158,7 +158,7 @@ func TestPostgresUserRepository_ChangeBalance(t *testing.T) {
 
 		newBalance, err := repo.ChangeBalance(ctx, userID, amount)
 		assert.Equal(t, int32(0), newBalance)
-		assert.ErrorIs(t, err, pkgerrors.ErrUserNotFoundOrInsufficientFunds)
+		assert.ErrorIs(t, err, pkgerrors.ErrUserNotFound)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -173,7 +173,7 @@ func TestPostgresUserRepository_ChangeBalance(t *testing.T) {
 
 		newBalance, err := repo.ChangeBalance(ctx, userID, amount)
 		assert.Equal(t, int32(0), newBalance)
-		assert.ErrorIs(t, err, pkgerrors.ErrUserNotFoundOrInsufficientFunds)
+		assert.ErrorIs(t, err, pkgerrors.ErrInsufficientFunds)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 

@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+      - "6060:6060"
     depends_on:
       postgres:
         condition: service_healthy
@@ -22,7 +23,7 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
     restart: on-failure
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"] # Предполагается, что есть эндпоинт /health
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -91,8 +92,8 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-      ZOOKEEPER_SESSION_TIMEOUT_MS: 60000 # Увеличенный таймаут
-      ZOOKEEPER_MAX_CLIENT_CNXNS: 100 # Больше подключений
+      ZOOKEEPER_SESSION_TIMEOUT_MS: 60000
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 100
     healthcheck:
       test: ["CMD", "zookeeper-shell", "localhost:2181", "ls", "/"]
       interval: 10s
@@ -119,9 +120,9 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.52
     ports:
-      - "16686:16686" # Веб-интерфейс
-      - "4318:4318"  # OTLP gRPC
-      - "4317:4317"  # OTLP HTTP
+      - "16686:16686"
+      - "4318:4318"
+      - "4317:4317"
     environment:
       - COLLECTOR_OTLP_ENABLED=true
       - COLLECTOR_ZIPKIN_HOST_PORT=:9411
